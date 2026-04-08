@@ -1,0 +1,40 @@
+# Shared grid/stimulus parameters (the 7 core constants from original file)
+grid:
+  checker_um: 30
+  height: 35
+  width: 35
+
+# Cell-type specific parameters (the 7 core biological constants per type)
+cell_types:
+  ON_Parasol:
+    rf_um: 300
+    peak1_ms: 35
+    peak2_ms: 55
+    width1_ms: 21
+    width2_ms: 38
+    amp1: 0.6
+    amp2: 0.3
+  OFF_Parasol:
+    rf_um: 250
+    peak1_ms: 20
+    peak2_ms: 70
+    width1_ms: 25
+    width2_ms: 50
+    amp1: 0.5
+    amp2: 0.15
+  ON_Midget:
+    rf_um: 125
+    peak1_ms: 30
+    peak2_ms: 70
+    width1_ms: 20
+    width2_ms: 50
+    amp1: 0.5
+    amp2: 0.15
+  OFF_Midget:
+    rf_um: 100
+    peak1_ms: 30
+    peak2_ms: 100
+    width1_ms: 25
+    width2_ms: 50
+    amp1: 0.5
+    amp2: 0.05
