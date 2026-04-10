@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as f
 
-from utils import Utils as u
+from sk_utils import Utils as u
 from skimage.transform import resize
 
 class RetinalGanglionCellMosaic(nn.Module):
