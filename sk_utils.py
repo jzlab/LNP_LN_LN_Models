@@ -6,6 +6,7 @@ import yaml
 import numpy as np
 import cv2
 import torch
+import numexpr as ne
 
 class Utils:
 
@@ -22,8 +23,22 @@ class Utils:
             path (str, optional): path to yaml file. Defaults to "params.yaml".
         """
 
+        # set the default loader to handle math expressions
+        def expr_contructor(loader, node):
+            expr = loader.construct_scalar(node)
+            return float(ne.evaluate(expr).item())
+        yaml.SafeLoader.add_constructor("!expr", expr_contructor)
+
         with open(path, 'r') as file:
             params = yaml.safe_load(file)
+
+        # convert params to int/float if necessary (just in case they havent been read properly)
+        for key, value in params.items():
+            if isinstance(value, str):
+                try:
+                    params[key] = float(value)
+                except ValueError:
+                    pass
 
         return params
     

@@ -107,9 +107,11 @@ class RetinalGanglionCellMosaic(nn.Module):
 
         # biphasic based on ON/OFF + cell type
         if self.m_params["cell_type"].startswith("OFF"):
-            return -lobe1 + lobe2
+            filter = -lobe1 + lobe2
         else:
-            return lobe1 - lobe2
+            filter = lobe1 - lobe2
+
+        return torch.flip(filter, dims=[0])
 
     def _spatiotemporal_filter(self):
         """
@@ -137,7 +139,7 @@ class RetinalGanglionCellMosaic(nn.Module):
         height, width = self.v_params["frame_shape"]
 
         # Adjust spacing
-        s = self.m_params["tiling_config"]["rf_diameter"] / self.m_params["tiling_config"]["coverage_factor"]
+        s = self.m_params["spatial"]["center_size"] / self.m_params["tiling_config"]["coverage_factor"]
 
         # Hexagonal lattice basis
         B = torch.tensor([
@@ -147,7 +149,7 @@ class RetinalGanglionCellMosaic(nn.Module):
         B_inv = torch.inverse(B)
 
         # Determine margin constraints
-        margin = self.m_params["tiling_config"]["rf_diameter"] / 2.0
+        margin = self.m_params["spatial"]["center_size"] / 2.0
 
         # Define rectangle corners in Cartesian space
         corners = torch.tensor([
@@ -251,19 +253,29 @@ class RetinalGanglionCellMosaic(nn.Module):
         # perform the matmul over all RGC positions
         linear = torch.zeros((self.n_cells, n_windows), device=x.device, dtype=torch.float32)
         
+        H, W = x_win.shape[2], x_win.shape[3]
+
         for i, pos in enumerate(self.mosaic_tensor):
             pos_x, pos_y = pos[0], pos[1]
-            
-            # Use original indexing: pos_x for 3rd dim, pos_y for 4th dim
-            v_start, v_end = int(pos_x - half_diam), int(pos_x + half_diam)
-            h_start, h_end = int(pos_y - half_diam), int(pos_y + half_diam)
-            
+
+            # Clamp to valid range to avoid negative-index wrap-around in PyTorch,
+            # which would produce an empty slice (e.g. tensor[52:22] → shape 0)
+            # for edge cells whose RF extends beyond the frame boundary.
+            v_start = max(0, int(pos_x - half_diam))
+            v_end   = min(H, int(pos_x + half_diam))
+            h_start = max(0, int(pos_y - half_diam))
+            h_end   = min(W, int(pos_y + half_diam))
+
             rf_patch = x_win[:, :, v_start:v_end, h_start:h_end]
-            
-            # Slicing can sometimes be slightly different sized due to rounding
-            # Here we just flatten what we got and matmul with w
-            # but original code assumed rf_patch matches w size
-            # w has size (L * H_rf * W_rf)
+
+            # Zero-pad back to (rf_diam x rf_diam) if the patch was clipped at
+            # a boundary. Biologically, cells looking beyond the frame see darkness.
+            # F.pad takes padding in reverse dim order: (left, right, top, bottom)
+            pad_bottom = rf_diam - (v_end - v_start)
+            pad_right  = rf_diam - (h_end - h_start)
+            if pad_bottom > 0 or pad_right > 0:
+                rf_patch = f.pad(rf_patch, (0, pad_right, 0, pad_bottom))
+
             linear[i] = rf_patch.reshape(n_windows, -1) @ self.w
 
         # apply activation and cap firing rate
