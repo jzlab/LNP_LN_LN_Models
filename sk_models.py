@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import math
 import random
 import numpy as np
 
@@ -13,6 +14,52 @@ import torch.nn.functional as f
 
 from sk_utils import Utils as u
 from skimage.transform import resize
+
+class Retina(nn.Module):
+    """
+    stores and manages multiple RGC Mosaics
+    """
+
+    def __init__(self, model_parameters:dict, video_parameters:dict):
+        """
+        stores and manages multiple RetinalGanglionCellMosaics
+        """
+        super().__init__()
+
+        self.m_params = model_parameters
+        self.v_params = video_parameters
+
+        self.mosaics = nn.ModuleList()
+        for cell_type, params in self.m_params.items():
+            if cell_type != "video_parameters":
+                self.mosaics.append(RetinalGanglionCellMosaic(params, self.v_params))
+
+        # store the max number of cells to pad properly
+        self.n_cells = max([m.n_cells for m in self.mosaics])
+
+    def forward(self, x):
+        """perform a forward pass through each RGC mosaic
+
+        Args:
+            x (torch.Tensor): input video of shape (T, H, W)
+
+        Returns:
+            torch.Tensor: output video of shape (T, H, W)
+        """
+
+        # pass through each mosaic
+        z = []
+        for mosaic in self.mosaics:
+            z.append(mosaic.forward(x)[1])
+
+        # pad the mosaics to the largest cell count
+        # biologically, this is because different RGC mosaics have larger cell count
+        # when they have smaller RFs, so we "create" dummy cells that are not activated
+        # to make the total number of cells equal across mosaics to make vectorization easier
+        for c in z:
+            print(c.shape)
+        z = [f.pad(c, (0, 0, 0, self.n_cells - c.shape[0]), 'constant', 0) for c in z]
+        return torch.stack(z, dim=0)
 
 class RetinalGanglionCellMosaic(nn.Module):
     """
@@ -256,25 +303,42 @@ class RetinalGanglionCellMosaic(nn.Module):
         H, W = x_win.shape[2], x_win.shape[3]
 
         for i, pos in enumerate(self.mosaic_tensor):
-            pos_x, pos_y = pos[0], pos[1]
+            pos_x, pos_y = pos[0].item(), pos[1].item()
 
-            # Clamp to valid range to avoid negative-index wrap-around in PyTorch,
-            # which would produce an empty slice (e.g. tensor[52:22] → shape 0)
-            # for edge cells whose RF extends beyond the frame boundary.
-            v_start = max(0, int(pos_x - half_diam))
-            v_end   = min(H, int(pos_x + half_diam))
-            h_start = max(0, int(pos_y - half_diam))
-            h_end   = min(W, int(pos_y + half_diam))
+            # Compute the ideal (unclamped) RF crop bounds using floor/ceil
+            # to correctly handle fractional positions.
+            # pos_y is vertical (H axis), pos_x is horizontal (W axis)
+            v_start_raw = math.floor(pos_y - half_diam)
+            v_end_raw   = v_start_raw + rf_diam
+            h_start_raw = math.floor(pos_x - half_diam)
+            h_end_raw   = h_start_raw + rf_diam
 
-            rf_patch = x_win[:, :, v_start:v_end, h_start:h_end]
+            # Clamp to actual frame dimensions
+            v_start = max(0, v_start_raw)
+            v_end   = min(H, v_end_raw)
+            h_start = max(0, h_start_raw)
+            h_end   = min(W, h_end_raw)
 
-            # Zero-pad back to (rf_diam x rf_diam) if the patch was clipped at
-            # a boundary. Biologically, cells looking beyond the frame see darkness.
-            # F.pad takes padding in reverse dim order: (left, right, top, bottom)
-            pad_bottom = rf_diam - (v_end - v_start)
-            pad_right  = rf_diam - (h_end - h_start)
-            if pad_bottom > 0 or pad_right > 0:
-                rf_patch = f.pad(rf_patch, (0, pad_right, 0, pad_bottom))
+            # Check if the RF overlaps with the frame at all
+            if v_start >= v_end or h_start >= h_end:
+                # RF is entirely outside the frame — fill with zeros
+                rf_patch = torch.zeros(
+                    (n_windows, win_size, rf_diam, rf_diam),
+                    device=x.device, dtype=torch.float32
+                )
+            else:
+                rf_patch = x_win[:, :, v_start:v_end, h_start:h_end]
+
+                # Compute padding for all four sides.
+                # Biologically, cells looking beyond the frame see darkness (zero).
+                # F.pad takes padding in reverse dim order: (left, right, top, bottom)
+                pad_top    = v_start - v_start_raw  # > 0 if RF extends above frame
+                pad_bottom = v_end_raw - v_end      # > 0 if RF extends below frame
+                pad_left   = h_start - h_start_raw  # > 0 if RF extends left of frame
+                pad_right  = h_end_raw - h_end      # > 0 if RF extends right of frame
+
+                if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
+                    rf_patch = f.pad(rf_patch, (pad_left, pad_right, pad_top, pad_bottom))
 
             linear[i] = rf_patch.reshape(n_windows, -1) @ self.w
 
