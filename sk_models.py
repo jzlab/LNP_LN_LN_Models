@@ -20,7 +20,7 @@ class Retina(nn.Module):
     stores and manages multiple RGC Mosaics
     """
 
-    def __init__(self, model_parameters:dict, video_parameters:dict):
+    def __init__(self, model_parameters:dict, video_parameters:dict, cell_minibatch_size:int=None, temporal_batch_size:int=None):
         """
         stores and manages multiple RetinalGanglionCellMosaics
         """
@@ -28,11 +28,18 @@ class Retina(nn.Module):
 
         self.m_params = model_parameters
         self.v_params = video_parameters
+        self.cell_minibatch_size = cell_minibatch_size
+        self.temporal_batch_size = temporal_batch_size
 
         self.mosaics = nn.ModuleList()
         for cell_type, params in self.m_params.items():
             if cell_type != "video_parameters":
-                self.mosaics.append(RetinalGanglionCellMosaic(params, self.v_params))
+                self.mosaics.append(RetinalGanglionCellMosaic(
+                    params, 
+                    self.v_params, 
+                    cell_minibatch_size=self.cell_minibatch_size,
+                    temporal_batch_size=self.temporal_batch_size
+                ))
 
         # store the max number of cells to pad properly
         self.n_cells = max([m.n_cells for m in self.mosaics])
@@ -44,22 +51,34 @@ class Retina(nn.Module):
             x (torch.Tensor): input video of shape (T, H, W)
 
         Returns:
-            torch.Tensor: output video of shape (T, H, W)
+            tuple: (linear_responses, firing_rates)
         """
 
         # pass through each mosaic
-        z = []
+        res_linear = []
+        res_rate = []
         for mosaic in self.mosaics:
-            z.append(mosaic.forward(x)[1])
+            lin, rate = mosaic.forward(x)
+            res_linear.append(lin)
+            res_rate.append(rate)
 
         # pad the mosaics to the largest cell count
         # biologically, this is because different RGC mosaics have larger cell count
         # when they have smaller RFs, so we "create" dummy cells that are not activated
         # to make the total number of cells equal across mosaics to make vectorization easier
-        for c in z:
-            print(c.shape)
-        z = [f.pad(c, (0, 0, 0, self.n_cells - c.shape[0]), 'constant', 0) for c in z]
-        return torch.stack(z, dim=0)
+        def pad_responses(tensors, target_n):
+            padded = []
+            for t in tensors:
+                if t.shape[0] < target_n:
+                    # pad the cell dimension (dim 0)
+                    t = f.pad(t, (0, 0, 0, target_n - t.shape[0]), 'constant', 0)
+                padded.append(t)
+            return torch.stack(padded, dim=0)
+
+        linear_stacked = pad_responses(res_linear, self.n_cells)
+        rates_stacked = pad_responses(res_rate, self.n_cells)
+
+        return linear_stacked, rates_stacked
 
 class RetinalGanglionCellMosaic(nn.Module):
     """
@@ -67,19 +86,23 @@ class RetinalGanglionCellMosaic(nn.Module):
     video input through spatiotemporal filtering and non-linear activation.
     """
 
-    def __init__(self, model_parameters: dict, video_parameters: dict):
+    def __init__(self, model_parameters: dict, video_parameters: dict, cell_minibatch_size: int = None, temporal_batch_size: int = None):
         """
         Initialize the RGC Mosaic model.
 
         Args:
             model_parameters (dict): Parameters for spatial, temporal, tiling and nonlinearity configuration.
             video_parameters (dict): Parameters for video properties like frame rate and shape.
+            cell_minibatch_size (int, optional): Number of cells to process in a single vectorized batch.
+            temporal_batch_size (int, optional): Number of temporal windows to process in a single vectorized batch.
         """
         super().__init__()
         
         # store the params
         self.m_params = model_parameters
         self.v_params = video_parameters
+        self.cell_minibatch_size = cell_minibatch_size
+        self.temporal_batch_size = temporal_batch_size
 
         # compute the spatiotemporal filter and register components
         self.spatial_filter = self._spatial_filter()
@@ -95,9 +118,55 @@ class RetinalGanglionCellMosaic(nn.Module):
         self.register_buffer('mosaic_tensor', torch.as_tensor(self.mosaic, dtype=torch.float32))
         self.n_cells = len(self.mosaic)
 
+        # Pre-compute spatial indices for vectorized gathering
+        self.rf_diam = self.m_params["tiling_config"]["rf_diameter"]
+        self.rf_indices = self._calculate_vectorized_indices()
+        self.register_buffer('rf_indices_tensor', self.rf_indices)
+
         # store the nonlinearity
         self.nonlinearity = self._nonlinearity()
         
+    def _calculate_vectorized_indices(self):
+        """
+        Pre-compute spatial pixel indices for each cell's receptive field.
+        These indices allow for the extraction of all cell patches in a single
+        vectorized gathering operation.
+
+        Returns:
+            torch.Tensor: Tensor of indices (N_cells, rf_diam * rf_diam).
+        """
+        height, width = self.v_params["frame_shape"]
+        rf_diam = self.rf_diam
+        half_diam = rf_diam / 2.0
+        
+        # We index into a padded frame to handle boundary cells safely.
+        # Padding size equals rf_diam to provide a 'dark' zone for all possible shifts.
+        padded_width = width + 2 * rf_diam
+        
+        # Generate local patch coordinates (offsets from center)
+        y_range = torch.arange(rf_diam)
+        x_range = torch.arange(rf_diam)
+        yy, xx = torch.meshgrid(y_range, x_range, indexing='ij')
+        local_offsets = yy * padded_width + xx
+
+        all_indices = []
+        for pos in self.mosaic_tensor:
+            pos_x, pos_y = pos[0].item(), pos[1].item()
+            
+            # Compute top-left corner of the RF in the PADDED frame.
+            # pos in original: (x, y). In padded: (x + rf_diam, y + rf_diam)
+            # v_start_raw in original: math.floor(pos_y - half_diam)
+            # v_start_padded: math.floor(pos_y - half_diam) + rf_diam
+            v_start_padded = math.floor(pos_y - half_diam) + rf_diam
+            h_start_padded = math.floor(pos_x - half_diam) + rf_diam
+            
+            # Generate flat indices for this cell's patch in the padded frame
+            base_index = v_start_padded * padded_width + h_start_padded
+            cell_indices = local_offsets.flatten() + base_index
+            all_indices.append(cell_indices)
+
+        return torch.stack(all_indices)
+
     def _spatial_filter(self):
         """
         Compute the spatial receptive field using a Difference of Gaussians (DoG).
@@ -273,7 +342,7 @@ class RetinalGanglionCellMosaic(nn.Module):
 
     def forward(self, x):
         """
-        Forward pass for the RGC Mosaic.
+        Forward pass for the RGC Mosaic using chunked vectorization.
 
         Args:
             x (np.ndarray or torch.Tensor): The input video stimulus (T, H, W).
@@ -287,62 +356,63 @@ class RetinalGanglionCellMosaic(nn.Module):
             x = torch.as_tensor(x, dtype=torch.float32)
         x = x.to(self.w.device).float()
 
-        # Reshape input to (N_windows, L, H, W)
+        # Reshape input to (N_windows, Win_size, H, W)
         win_size = len(self.temporal_filter_tensor)
-        # unfold(dim, size, step) on (T, H, W) -> (N_win, H, W, L)
-        # Step is 1 by default for sliding window
         x_win = x.unfold(0, win_size, 1).permute(0, 3, 1, 2)
         
-        n_windows = x_win.shape[0]
-        rf_diam = self.m_params["tiling_config"]["rf_diameter"]
-        half_diam = rf_diam / 2.0
-
-        # perform the matmul over all RGC positions
-        linear = torch.zeros((self.n_cells, n_windows), device=x.device, dtype=torch.float32)
+        n_windows, _, H, W = x_win.shape
+        rf_diam = self.rf_diam
         
-        H, W = x_win.shape[2], x_win.shape[3]
+        # Pad the entire windowed video sequence once to handle boundary RFs.
+        # Padding with zero (representing darkness) matches the original logic.
+        # F.pad order: (left, right, top, bottom)
+        x_win_padded = f.pad(x_win, (rf_diam, rf_diam, rf_diam, rf_diam), mode='constant', value=0)
+        
+        # Flatten the spatial dimensions of the padded frames for gathering
+        # Shape: (N_windows, Win_size, Padded_Pixels)
+        x_win_flat = x_win_padded.reshape(n_windows, win_size, -1)
+        
+        # Determine minibatch sizes (using defaults if not provided)
+        t_batch_size = self.temporal_batch_size if self.temporal_batch_size else n_windows
+        c_batch_size = self.cell_minibatch_size if self.cell_minibatch_size else self.n_cells
 
-        for i, pos in enumerate(self.mosaic_tensor):
-            pos_x, pos_y = pos[0].item(), pos[1].item()
+        linear = torch.zeros((self.n_cells, n_windows), device=x.device, dtype=torch.float32)
 
-            # Compute the ideal (unclamped) RF crop bounds using floor/ceil
-            # to correctly handle fractional positions.
-            # pos_y is vertical (H axis), pos_x is horizontal (W axis)
-            v_start_raw = math.floor(pos_y - half_diam)
-            v_end_raw   = v_start_raw + rf_diam
-            h_start_raw = math.floor(pos_x - half_diam)
-            h_end_raw   = h_start_raw + rf_diam
+        # Vectorized hierarchical batching
+        for t_start in range(0, n_windows, t_batch_size):
+            t_end = min(t_start + t_batch_size, n_windows)
+            
+            # Select frame chunk: (T_chunk, Win_size, Padded_Pixels)
+            x_chunk = x_win_flat[t_start:t_end]
+            
+            for c_start in range(0, self.n_cells, c_batch_size):
+                c_end = min(c_start + c_batch_size, self.n_cells)
+                
+                # Extract indices for this minibatch: (C_chunk, RF_Pixels)
+                indices = self.rf_indices_tensor[c_start:c_end]
+                
+                # Gather patches for all cells and windows in batch simultaneously
+                # x_chunk is (T_chunk, Win_size, Padded_Pixels)
+                # indices is (C_chunk, RF_Pixels)
+                # We want result: (T_chunk, C_chunk, Win_size * RF_Pixels)
+                
+                # Use advanced indexing to gather across windows and cells
+                # We need to expand indices to (T_chunk, C_chunk, RF_Pixels)
+                # and take from x_chunk's last dimension.
+                
+                # Shape: (T_chunk, Win_size, C_chunk, RF_Pixels)
+                patches = x_chunk[:, :, indices] 
+                
+                # Reshape to (T_chunk, C_chunk, Win_size * RF_Pixels)
+                # .permute(0, 2, 1, 3) -> (T_chunk, C_chunk, Win_size, RF_Pixels)
+                patches = patches.permute(0, 2, 1, 3).reshape(t_end - t_start, c_end - c_start, -1)
+                
+                # Matrix multiplication with shared filter w: (T_chunk, C_chunk)
+                # self.w is (Win_size * RF_Pixels)
+                # results: (T_chunk, C_chunk)
+                linear[c_start:c_end, t_start:t_end] = (patches @ self.w).T
 
-            # Clamp to actual frame dimensions
-            v_start = max(0, v_start_raw)
-            v_end   = min(H, v_end_raw)
-            h_start = max(0, h_start_raw)
-            h_end   = min(W, h_end_raw)
-
-            # Check if the RF overlaps with the frame at all
-            if v_start >= v_end or h_start >= h_end:
-                # RF is entirely outside the frame — fill with zeros
-                rf_patch = torch.zeros(
-                    (n_windows, win_size, rf_diam, rf_diam),
-                    device=x.device, dtype=torch.float32
-                )
-            else:
-                rf_patch = x_win[:, :, v_start:v_end, h_start:h_end]
-
-                # Compute padding for all four sides.
-                # Biologically, cells looking beyond the frame see darkness (zero).
-                # F.pad takes padding in reverse dim order: (left, right, top, bottom)
-                pad_top    = v_start - v_start_raw  # > 0 if RF extends above frame
-                pad_bottom = v_end_raw - v_end      # > 0 if RF extends below frame
-                pad_left   = h_start - h_start_raw  # > 0 if RF extends left of frame
-                pad_right  = h_end_raw - h_end      # > 0 if RF extends right of frame
-
-                if pad_top > 0 or pad_bottom > 0 or pad_left > 0 or pad_right > 0:
-                    rf_patch = f.pad(rf_patch, (pad_left, pad_right, pad_top, pad_bottom))
-
-            linear[i] = rf_patch.reshape(n_windows, -1) @ self.w
-
-        # apply activation and cap firing rate
+        # Apply activation and cap firing rate
         nonlinear = self.nonlinearity(linear)
         firing_rate = torch.clamp(nonlinear, max=float(self.m_params["max_firing_rate"]))
 
