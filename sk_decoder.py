@@ -139,7 +139,11 @@ class Decoder(nn.Module):
             torch.Tensor: Reconstructed frames of shape (T, 1, H, W).
         """
         # --- Handle Retina output shapes ---
-        if x.dim() == 3:
+        if x.dim() == 4:
+            # (batch, n_mosaics, n_cells, temp) -> (batch, n_mosaics * n_cells * temp)
+            batch_size, n_mosaics, n_cells, temp = x.shape
+            x = x.reshape(batch_size, -1)
+        elif x.dim() == 3:
             # (n_mosaics, n_cells, T) -> (T, n_mosaics * n_cells)
             n_mosaics, n_cells, T = x.shape
             x = x.permute(2, 0, 1).contiguous().view(T, n_mosaics * n_cells)
