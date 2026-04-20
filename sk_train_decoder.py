@@ -83,8 +83,8 @@ def train(args):
     train_size = len(dataset) - val_size
     train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # 3. Model Initialization
     n_mosaics, max_n_cells, _ = dataset.firing_rates.shape
@@ -101,18 +101,21 @@ def train(args):
     criterion = nn.MSELoss()
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Model initialized. Total trainable parameters: {num_params:,}")
+    print(f"Model initialized. Total trainable parameters: {num_params:,}\n")
 
     # 4. Training Loop
+    best_epoch = 0
     best_val_loss = float('inf')
+    train_loss_history = []
+    val_loss_history = []
     
-    epoch_pbar = tqdm(range(epochs), desc="Training Progress")
+    epoch_pbar = tqdm(range(epochs), desc="Training Progress", dynamic_ncols=False, leave=True)
     for epoch in epoch_pbar:
         model.train()
         train_loss = 0
         
-        batch_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
-        for x, y in batch_pbar:
+        # iterate through the batches
+        for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             
             optimizer.zero_grad()
@@ -122,7 +125,6 @@ def train(args):
             optimizer.step()
             
             train_loss += loss.item()
-            batch_pbar.set_postfix({"loss": f"{loss.item():.6f}"})
             
         # Validation
         model.eval()
@@ -136,15 +138,33 @@ def train(args):
         avg_train = train_loss / len(train_loader)
         avg_val = val_loss / len(val_loader)
         
+        train_loss_history.append(avg_train)
+        val_loss_history.append(avg_val)
+        
         epoch_pbar.set_description(f"Epoch {epoch+1}/{epochs}")
-        epoch_pbar.set_postfix({"Train MSE": f"{avg_train:.6f}", "Val MSE": f"{avg_val:.6f}"})
+        epoch_pbar.set_postfix({"Train MSE": f"{avg_train:.6f}", "Val MSE": f"{avg_val:.6f}", "Best Val MSE": f"{best_val_loss:.6f} @ Epoch {best_epoch}"})
         
         if avg_val < best_val_loss:
+            best_epoch = epoch + 1
             best_val_loss = avg_val
-            torch.save(model.state_dict(), args.output)
-            print(f"\nNew best model saved to {args.output} (Val MSE: {avg_val:.6f})")
+            save_dict = {
+                'model_state_dict': model.state_dict(),
+                'train_loss_history': train_loss_history,
+                'val_loss_history': val_loss_history
+            }
+            torch.save(save_dict, args.output)
 
     print("\nTraining Complete.")
+    
+    # Save the final model and full history
+    last_output = args.output.replace(".pt", "_final.pt") if ".pt" in args.output else args.output + "_final.pt"
+    save_dict = {
+        'model_state_dict': model.state_dict(),
+        'train_loss_history': train_loss_history,
+        'val_loss_history': val_loss_history
+    }
+    torch.save(save_dict, last_output)
+    print(f"Final model and training history saved to {last_output}\n")
 
 def main():
     parser = argparse.ArgumentParser(description="Train the Decoder model on RGC activations.")

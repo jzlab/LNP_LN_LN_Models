@@ -1,15 +1,10 @@
 # Hyperparameters for Decoder Training
 learning_rate: 0.0001
-batch_size: 16
-epochs: 50
+batch_size: 64
+epochs: 400
 validation_split: 0.1
 device: "cuda"
 
 # Data alignment
 input_window_size: 1  # Number of successive RGC timepoints to use for one frame reconstruction
 target_frame_offset: "last" # Options: "last" (end of RGC temporal memory) or "center"
-
-# Model Architecture (inherited by Decoder)
-num_blocks: 4
-num_kernels: 64
-bias: false

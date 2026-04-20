@@ -120,5 +120,5 @@ OFF_Midget:
     type: soft-rectifier
 
 video_parameters:
-  frame_shape: [256, 256]
+  frame_shape: [64, 64]
   frame_rate: 30

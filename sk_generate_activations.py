@@ -85,7 +85,7 @@ def save_activations(firing_rates, output_path, video_path, fps, crop_shape, x_s
 def main():
     parser = argparse.ArgumentParser(description="Generate RGC activations from a video using the Retina model.")
     parser.add_argument("--video", type=str, required=True, help="Path to the input video file.")
-    parser.add_argument("--params", type=str, default="params.yaml", help="Path to the params.yaml file.")
+    parser.add_argument("--params", type=str, default="params.yaml", help="Path to params.yaml.")
     parser.add_argument("--output", type=str, required=True, help="Path to save the output activations (e.g., activations.pt).")
     parser.add_argument("--x", type=int, default=0, help="Top-left X coordinate (column) for the spatial crop.")
     parser.add_argument("--y", type=int, default=0, help="Top-left Y coordinate (row) for the spatial crop.")
