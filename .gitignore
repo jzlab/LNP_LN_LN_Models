@@ -1,2 +1,5 @@
 /__pycache__
 **/*.pt
+
+/testing_videos
+/lnp_activations_bank

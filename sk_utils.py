@@ -61,4 +61,4 @@ class Utils:
         cap.release()
 
         # return the frames and relevant properties
-        return np.array(frames), fps
+        return np.array(frames), {"fps": fps, "width": width, "height": height, "total_frames": total_frames}

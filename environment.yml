@@ -23,6 +23,8 @@ dependencies:
   - fonttools=4.25.0
   - freetype=2.10.4
   - fsspec=2026.3.0
+  - h5py=3.16.0
+  - hdf5=1.14.6
   - imageio=2.37.0
   - importlib-metadata=8.7.0
   - ipykernel=7.2.0

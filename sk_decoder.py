@@ -31,7 +31,7 @@ class BF_batchNorm(nn.Module):
             x = x * self.gammas.expand_as(x)
         return x
 
-class Decoder(nn.Module):
+class RetinaDecoder(nn.Module):
     """
     A UNet-like decoder to reconstruct images from Retinal Ganglion Cell (RGC) responses.
     
@@ -184,8 +184,8 @@ if __name__ == "__main__":
         "num_blocks": 3,
         "num_kernels": 32
     }
-    model = Decoder(test_params)
-    print(f"Decoder initialized. Bottleneck: {model.h0}x{model.w0}")
+    model = RetinaDecoder(test_params)
+    print(f"RetinaDecoder initialized. Bottleneck: {model.h0}x{model.w0}")
     
     # Simulate Retina output: (1 mosaic, 1000 cells, 5 frames)
     dummy_input = torch.randn(1, 1000, 5)
