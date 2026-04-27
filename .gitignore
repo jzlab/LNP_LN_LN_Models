@@ -1,5 +1,8 @@
 /__pycache__
 **/*.pt
+**/*.h5
+**/*reconstructed.*
+notes.txt
 
 /testing_videos
 /lnp_activations_bank
