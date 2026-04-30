@@ -45,10 +45,10 @@ class RGCDataset(Dataset):
             for local_idx in trials_grp.keys():
                 trial_grp = trials_grp[local_idx]
                 
-                fr_shape = trial_grp["firing_rates"].shape
+                fr_shape = trial_grp["firing_rates"]["0"].shape
                 vf_shape = trial_grp["target_video"].shape
                 
-                n_windows = fr_shape[2]
+                n_windows = fr_shape[1]
                 T = vf_shape[0]
                 retina_win_size = T - n_windows + 1
                 
@@ -63,7 +63,8 @@ class RGCDataset(Dataset):
         # Save dimensions for model initialization
         f0 = self.open_files[0]
         first_trial = list(f0["trials"].keys())[0]
-        self.n_mosaics, self.max_n_cells, _ = f0["trials"][first_trial]["firing_rates"].shape
+        fr_grp = f0["trials"][first_trial]["firing_rates"]
+        self.n_cells_per_mosaic = [fr_grp[str(i)].shape[0] for i in range(len(fr_grp.keys()))]
         self.frame_shape = f0["trials"][first_trial]["target_video"].shape[1:]
 
     def __len__(self):
@@ -73,18 +74,21 @@ class RGCDataset(Dataset):
         file_idx, local_idx, t, retina_win_size = self.index_map[idx]
         h5_file = self.open_files[file_idx]
         
-        fr_ds = h5_file[f"trials/{local_idx}/firing_rates"]
+        fr_grp = h5_file[f"trials/{local_idx}/firing_rates"]
         vf_ds = h5_file[f"trials/{local_idx}/target_video"]
         
-        x_np = fr_ds[:, :, t - (self.input_window - 1) : t + 1]
+        x_list = []
+        for m_idx in range(len(fr_grp.keys())):
+            ds = fr_grp[str(m_idx)]
+            x_np = ds[:, t - (self.input_window - 1) : t + 1]
+            x_list.append(torch.from_numpy(x_np).float())
         
         target_idx = t + retina_win_size - 1
         y_np = vf_ds[target_idx]
         
-        x = torch.from_numpy(x_np).float()
         y = torch.from_numpy(y_np).unsqueeze(0).float()
         
-        return x, y
+        return x_list, y
         
     def __del__(self):
         for f in getattr(self, 'open_files', []):
@@ -120,9 +124,8 @@ def train(args):
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
     # 3. Model Initialization
-    n_mosaics, max_n_cells = dataset.n_mosaics, dataset.max_n_cells
     decoder_params = {
-        "n_cells": n_mosaics * max_n_cells * dataset.input_window,
+        "n_cells_per_mosaic": [n * dataset.input_window for n in dataset.n_cells_per_mosaic],
         "frame_shape": dataset.frame_shape,
         "num_blocks": train_cfg.get("num_blocks", 4),
         "num_kernels": train_cfg.get("num_kernels", 64),
@@ -132,6 +135,7 @@ def train(args):
     model = RetinaDecoder(decoder_params).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
+    print(model)
 
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model initialized. Total trainable parameters: {num_params:,}\n")
@@ -148,11 +152,12 @@ def train(args):
         train_loss = 0
         
         # iterate through the batches
-        for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+        for x_list, y in train_loader:
+            x_list = [x.to(device) for x in x_list]
+            y = y.to(device)
             
             optimizer.zero_grad()
-            output = model(x)
+            output = model(x_list)
             loss = criterion(output, y)
             loss.backward()
             optimizer.step()
@@ -163,9 +168,10 @@ def train(args):
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
-                output = model(x)
+            for x_list, y in val_loader:
+                x_list = [x.to(device) for x in x_list]
+                y = y.to(device)
+                output = model(x_list)
                 val_loss += criterion(output, y).item()
         
         avg_train = train_loss / len(train_loader)

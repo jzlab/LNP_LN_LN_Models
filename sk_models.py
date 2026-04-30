@@ -44,7 +44,7 @@ class Retina(nn.Module):
         # store the max number of cells to pad properly
         self.n_cells = max([m.n_cells for m in self.mosaics])
 
-    def forward(self, x):
+    def forward(self, x, pad=True):
         """perform a forward pass through each RGC mosaic
 
         Args:
@@ -73,12 +73,14 @@ class Retina(nn.Module):
                     # pad the cell dimension (dim 0)
                     t = f.pad(t, (0, 0, 0, target_n - t.shape[0]), 'constant', 0)
                 padded.append(t)
-            return torch.stack(padded, dim=0)
+            return padded
 
-        linear_stacked = pad_responses(res_linear, self.n_cells)
-        rates_stacked = pad_responses(res_rate, self.n_cells)
-
-        return linear_stacked, rates_stacked
+        if pad:
+            padded_linear = pad_responses(res_linear, self.n_cells)
+            padded_rate = pad_responses(res_rate, self.n_cells)
+            return torch.stack(padded_linear), torch.stack(padded_rate)
+        else:
+            return res_linear, res_rate
 
 class RetinalGanglionCellMosaic(nn.Module):
     """

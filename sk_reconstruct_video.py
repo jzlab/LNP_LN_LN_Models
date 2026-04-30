@@ -10,12 +10,12 @@ from tqdm import tqdm
 from sk_utils import Utils as u
 from sk_decoder import RetinaDecoder
 
-def setup_decoder(params, training_params, n_cells_total, device="cpu", weights_path=None):
+def setup_decoder(params, training_params, n_cells_per_mosaic, device="cpu", weights_path=None):
     print("Initializing Decoder model...")
     input_window = training_params.get("input_window_size", 1)
     
     decoder_params = {
-        "n_cells": n_cells_total,
+        "n_cells_per_mosaic": n_cells_per_mosaic,
         "frame_shape": params.get("video_parameters", {}).get("frame_shape", [128, 128]),
         "num_blocks": training_params.get("num_blocks", 4),
         "num_kernels": training_params.get("num_kernels", 64),
@@ -33,11 +33,11 @@ def setup_decoder(params, training_params, n_cells_total, device="cpu", weights_
     model.eval()
     return model, input_window
 
-def decode_activations(firing_rates, decoder, input_window, original_T, device="cpu"):
+def decode_activations(firing_rates_list, decoder, input_window, original_T, device="cpu"):
     """
-    firing_rates: (n_mosaics, max_cells, n_windows)
+    firing_rates_list: list of tensors, each (max_cells, n_windows)
     """
-    n_windows = firing_rates.shape[2]
+    n_windows = firing_rates_list[0].shape[1]
     
     # Valid indices where we have sufficient context:
     valid_indices = np.arange(input_window - 1, n_windows)
@@ -49,14 +49,15 @@ def decode_activations(firing_rates, decoder, input_window, original_T, device="
         for start_idx in range(0, len(valid_indices), batch_size):
             end_idx = min(start_idx + batch_size, len(valid_indices))
             
-            x_batch = []
+            x_batch_list = [[] for _ in range(len(firing_rates_list))]
             for i in range(start_idx, end_idx):
                 t = valid_indices[i]
-                x = firing_rates[:, :, t - (input_window - 1) : t + 1]
-                x_batch.append(x)
+                for m_idx in range(len(firing_rates_list)):
+                    x = firing_rates_list[m_idx][:, t - (input_window - 1) : t + 1]
+                    x_batch_list[m_idx].append(x)
             
-            x_batch = torch.stack(x_batch).to(device) # (B, mosaics, cells, temp)
-            out = decoder(x_batch) # (B, 1, H, W)
+            x_batch_list = [torch.stack(b).to(device) for b in x_batch_list]
+            out = decoder(x_batch_list) # (B, 1, H, W)
             out = out.squeeze(1).cpu().numpy() # (B, H, W)
             decoded_frames.extend(out)
             
@@ -78,6 +79,7 @@ def main():
     parser.add_argument("--output-activations", type=str, default="full_video_activations.pt")
     parser.add_argument("--output-video", type=str, default="reconstructed.mp4")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--zero-celltype", type=int, nargs="+", default=None, help="Indices of celltypes to zero out before decoding")
     
     args = parser.parse_args()
     
@@ -148,8 +150,11 @@ def main():
                 with h5py.File(tmp_act_path, 'r') as f:
                     trials_grp = f["trials"]
                     first_k = list(trials_grp.keys())[0]
-                    fr_array = trials_grp[first_k]["firing_rates"][:]
-                    activations_dict[(r, c)] = torch.from_numpy(fr_array)
+                    fr_grp = trials_grp[first_k]["firing_rates"]
+                    fr_list = []
+                    for m_idx in range(len(fr_grp.keys())):
+                        fr_list.append(torch.from_numpy(fr_grp[str(m_idx)][:]))
+                    activations_dict[(r, c)] = fr_list
                 
                 # Remove tmp file to save disk space
                 os.remove(tmp_act_path)
@@ -163,12 +168,12 @@ def main():
     
     # 2. Setup Decoder & Decode
     sample_act = activations_dict[(0,0)]
-    n_mosaics, max_n_cells, n_windows = sample_act.shape
     input_window = train_params.get("input_window_size", 1)
     
-    n_cells_total = n_mosaics * max_n_cells * input_window
-    decoder, _ = setup_decoder(params, train_params, n_cells_total=n_cells_total, device=args.device, weights_path=args.weights)
+    n_cells_per_mosaic = [act.shape[0] * input_window for act in sample_act]
+    decoder, _ = setup_decoder(params, train_params, n_cells_per_mosaic=n_cells_per_mosaic, device=args.device, weights_path=args.weights)
     
+    n_windows = sample_act[0].shape[1]
     decoded_T = n_windows - input_window + 1
     output_buffer = np.zeros((decoded_T, H_pad, W_pad), dtype=np.float32)
     
@@ -180,8 +185,12 @@ def main():
             x_start = c * patch_w
             x_end = x_start + patch_w
             
-            firing_rates = activations_dict[(r, c)]
-            decoded_patch, start_frame_idx = decode_activations(firing_rates, decoder, input_window, T, device=args.device)
+            firing_rates_list = activations_dict[(r, c)]
+            if args.zero_celltype is not None:
+                for celltype in args.zero_celltype:
+                    firing_rates_list[celltype][:, :] = 0.0
+                
+            decoded_patch, start_frame_idx = decode_activations(firing_rates_list, decoder, input_window, T, device=args.device)
             output_buffer[:, y_start:y_end, x_start:x_end] = decoded_patch
 
     # 3. Stitching & Export

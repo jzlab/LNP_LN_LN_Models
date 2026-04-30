@@ -70,7 +70,8 @@ class RetinaDecoder(nn.Module):
         
         self.params = params
         self.target_h, self.target_w = params["frame_shape"]
-        self.n_cells = params["n_cells"]
+        self.n_cells_per_mosaic = params["n_cells_per_mosaic"]
+        self.total_cells = sum(self.n_cells_per_mosaic)
         
         self.num_blocks = params.get("num_blocks", 3)
         self.num_kernels = params.get("num_kernels", 64)
@@ -85,8 +86,22 @@ class RetinaDecoder(nn.Module):
         # Channel count at the bottleneck
         self.bottleneck_ch = self.num_kernels * (2 ** self.num_blocks)
         
-        # 1. Linear projection to feature space
-        self.w = nn.Linear(self.n_cells, self.bottleneck_ch * self.h0 * self.w0)
+        # 1. Linear projection to feature space (Independent Mosaics)
+        # Weight the number of channels proportionally to the cell count of each mosaic
+        self.ch_per_mosaic = []
+        remaining_ch = self.bottleneck_ch
+        for i, n_cells in enumerate(self.n_cells_per_mosaic):
+            if i == len(self.n_cells_per_mosaic) - 1:
+                ch = remaining_ch
+            else:
+                ch = int(round(self.bottleneck_ch * (n_cells / self.total_cells)))
+                remaining_ch -= ch
+            self.ch_per_mosaic.append(ch)
+            
+        self.w_mosaics = nn.ModuleList([
+            nn.Linear(n_cells, ch * self.h0 * self.w0)
+            for n_cells, ch in zip(self.n_cells_per_mosaic, self.ch_per_mosaic)
+        ])
         
         # 2. Mid Block
         self.mid_block = nn.Sequential(
@@ -126,41 +141,35 @@ class RetinaDecoder(nn.Module):
                     nn.ReLU(inplace=True)
                 )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_list: list) -> torch.Tensor:
         """
         Forward pass for image reconstruction.
         
         Supports inputs from the Retina model:
-        - (n_mosaics, n_cells, T): Concatenates mosaics across cell dimension.
-        - (n_cells, T): Single mosaic input.
-        - (batch, n_cells): Direct feature input.
+        - A list of tensors, one for each mosaic, each of shape (batch, n_cells, temp)
         
         Returns:
             torch.Tensor: Reconstructed frames of shape (T, 1, H, W).
         """
-        # --- Handle Retina output shapes ---
-        if x.dim() == 4:
-            # (batch, n_mosaics, n_cells, temp) -> (batch, n_mosaics * n_cells * temp)
-            batch_size, n_mosaics, n_cells, temp = x.shape
-            x = x.reshape(batch_size, -1)
-        elif x.dim() == 3:
-            # (n_mosaics, n_cells, T) -> (T, n_mosaics * n_cells)
-            n_mosaics, n_cells, T = x.shape
-            x = x.permute(2, 0, 1).contiguous().view(T, n_mosaics * n_cells)
-        elif x.dim() == 2:
-            # If shape is (n_cells, T), transpose to (T, n_cells)
-            # Assumption: n_cells > T for typical use cases, or check if likely flipped
-            if x.shape[1] > x.shape[0] and x.shape[0] == self.n_cells:
-                # Likely (n_cells, batch)
-                 pass # batch=T already if we treat it as (batch, n_cells)
-            elif x.shape[0] == self.n_cells and x.shape[1] < x.shape[0]:
-                x = x.T # Convert from (n_cells, batch) to (batch, n_cells)
+        z_list = []
+        batch_size = x_list[0].shape[0]
         
-        batch_size = x.shape[0]
-        
-        # 1. Project to feature map
-        z = self.w(x)
-        z = z.view(batch_size, self.bottleneck_ch, self.h0, self.w0)
+        for i, x in enumerate(x_list):
+            if x.dim() == 3:
+                # (batch, n_cells, temp) -> (batch, n_cells * temp)
+                x = x.reshape(batch_size, -1)
+            elif x.dim() == 2:
+                # Transpose if passed as (n_cells, batch)
+                if x.shape[0] == self.n_cells_per_mosaic[i] and x.shape[1] < x.shape[0]:
+                    x = x.T
+                    
+            # Project to feature map
+            z = self.w_mosaics[i](x)
+            z = z.view(batch_size, self.ch_per_mosaic[i], self.h0, self.w0)
+            z_list.append(z)
+            
+        # Concatenate mosaic features along channel dimension
+        z = torch.cat(z_list, dim=1) # (batch, bottleneck_ch, h0, w0)
         
         # 2. Mid block
         z = self.mid_block(z)
