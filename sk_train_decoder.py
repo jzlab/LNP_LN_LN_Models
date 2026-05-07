@@ -1,6 +1,7 @@
 import os
 import glob
 import yaml
+import h5py
 import argparse
 import torch
 import torch.nn as nn
@@ -13,89 +14,91 @@ from sk_decoder import RetinaDecoder
 class RGCDataset(Dataset):
     """
     Dataset that pairs RGC activations with their corresponding video frames.
+
+    HDF5 file handles are opened lazily per worker process (keyed by PID) so
+    the dataset can be safely used with num_workers > 0 in DataLoader.
     """
     def __init__(self, activations_path, training_params_path):
-        import h5py
-        
+
         train_cfg = u.read_params(training_params_path)
         self.input_window = train_cfg.get("input_window_size", 1)
-        
+
         if os.path.isdir(activations_path):
             file_paths = glob.glob(os.path.join(activations_path, "*.h5"))
         else:
             file_paths = [activations_path]
-            
+
         if not file_paths:
             raise ValueError(f"No .h5 files found for path: {activations_path}")
-            
-        self.open_files = []
-        self.index_map = []
-        
-        for fp in file_paths:
-            f = h5py.File(fp, 'r')
-            file_idx = len(self.open_files)
-            self.open_files.append(f)
-            
-            if "trials" not in f:
-                print(f"Skipping {fp}: not in trials format.")
-                continue
-                
-            trials_grp = f["trials"]
-            
-            for local_idx in trials_grp.keys():
-                trial_grp = trials_grp[local_idx]
-                
-                fr_shape = trial_grp["firing_rates"]["0"].shape
-                vf_shape = trial_grp["target_video"].shape
-                
-                n_windows = fr_shape[1]
-                T = vf_shape[0]
-                retina_win_size = T - n_windows + 1
-                
-                for t in range(self.input_window - 1, n_windows):
-                    self.index_map.append((file_idx, local_idx, t, retina_win_size))
+
+        # Store paths only — handles are opened lazily in __getitem__ per worker.
+        self.file_paths = file_paths
+        self.index_map  = []
+        # pid -> [h5py.File, ...]
+        self._file_handles: dict = {}
+
+        for file_idx, fp in enumerate(file_paths):
+            with h5py.File(fp, 'r') as f:
+                if "trials" not in f:
+                    print(f"Skipping {fp}: not in trials format.")
+                    continue
+
+                for local_idx in f["trials"].keys():
+                    trial_grp = f["trials"][local_idx]
+                    fr_shape  = trial_grp["firing_rates"]["0"].shape
+                    vf_shape  = trial_grp["target_video"].shape
                     
-        print(f"Dataset compiled: {len(self.index_map)} valid spatiotemporal samples from {len(file_paths)} files.")
-        
+                    # Assuming transposed format (T_windows, n_cells)
+                    n_windows = fr_shape[0]
+                    retina_win_size = vf_shape[0] - n_windows + 1
+                    for t in range(self.input_window - 1, n_windows):
+                        self.index_map.append((file_idx, local_idx, t, retina_win_size))
+
+        print(f"Dataset compiled: {len(self.index_map)} spatiotemporal samples from {len(file_paths)} files.")
         if len(self.index_map) == 0:
-             raise ValueError("No valid trials found in the provided activations.")
-        
-        # Save dimensions for model initialization
-        f0 = self.open_files[0]
-        first_trial = list(f0["trials"].keys())[0]
-        fr_grp = f0["trials"][first_trial]["firing_rates"]
-        self.n_cells_per_mosaic = [fr_grp[str(i)].shape[0] for i in range(len(fr_grp.keys()))]
-        self.frame_shape = f0["trials"][first_trial]["target_video"].shape[1:]
+            raise ValueError("No valid trials found in the provided activations.")
+
+        # Save dimensions for model initialisation
+        with h5py.File(file_paths[0], 'r') as f0:
+            first_trial = list(f0["trials"].keys())[0]
+            fr_grp = f0["trials"][first_trial]["firing_rates"]
+            self.n_cells_per_mosaic = [fr_grp[str(i)].shape[1] for i in range(len(fr_grp))]
+            self.frame_shape = f0["trials"][first_trial]["target_video"].shape[1:]
+
+    def _get_handles(self):
+        """Return this process's open HDF5 handles, opening them if necessary."""
+        import h5py
+        pid = os.getpid()
+        if pid not in self._file_handles:
+            self._file_handles[pid] = [h5py.File(fp, 'r') for fp in self.file_paths]
+        return self._file_handles[pid]
 
     def __len__(self):
         return len(self.index_map)
 
     def __getitem__(self, idx):
         file_idx, local_idx, t, retina_win_size = self.index_map[idx]
-        h5_file = self.open_files[file_idx]
-        
+        h5_file = self._get_handles()[file_idx]
+
         fr_grp = h5_file[f"trials/{local_idx}/firing_rates"]
-        vf_ds = h5_file[f"trials/{local_idx}/target_video"]
-        
+        vf_ds  = h5_file[f"trials/{local_idx}/target_video"]
+
         x_list = []
-        for m_idx in range(len(fr_grp.keys())):
-            ds = fr_grp[str(m_idx)]
-            x_np = ds[:, t - (self.input_window - 1) : t + 1]
-            x_list.append(torch.from_numpy(x_np).float())
-        
-        target_idx = t + retina_win_size - 1
-        y_np = vf_ds[target_idx]
-        
-        y = torch.from_numpy(y_np).unsqueeze(0).float()
-        
+        for m_idx in range(len(fr_grp)):
+            # Indexing (T_windows, n_cells) -> slice time, then transpose back to (n_cells, Win)
+            x_np = fr_grp[str(m_idx)][t - (self.input_window - 1) : t + 1, :].T
+            x_list.append(torch.tensor(x_np, dtype=torch.float32))
+
+        y = torch.tensor(vf_ds[t + retina_win_size - 1], dtype=torch.float32).unsqueeze(0)
         return x_list, y
-        
+
     def __del__(self):
-        for f in getattr(self, 'open_files', []):
-            try:
-                f.close()
-            except:
-                pass
+        for handles in getattr(self, '_file_handles', {}).values():
+            for f in handles:
+                try:
+                    f.close()
+                except Exception:
+                    pass
 
 def train(args):
     # 1. Load Configurations
@@ -113,15 +116,86 @@ def train(args):
     # 2. Data Preparation
     print(f"Loading data from {args.activations}...")
     dataset = RGCDataset(args.activations, args.training_params)
-    
+
+    dataset_prop = args.dataset_prop if args.dataset_prop is not None else train_cfg.get("dataset_prop", 1.0)
+    num_workers  = args.num_workers  if args.num_workers  is not None else train_cfg.get("num_workers",  4)
+
     # Validation split
-    val_split = train_cfg.get("validation_split", 0.1)
-    val_size = int(len(dataset) * val_split)
+    val_split  = train_cfg.get("validation_split", 0.1)
+    val_size   = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
     train_ds, val_ds = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    # Draw one fixed random subset per split and keep it for the entire run.
+    # DataLoader shuffle=True still randomises *order* within the subset each epoch.
+    def _fixed_subset(base_ds, n_total, prop):
+        n = max(1, int(n_total * prop))
+        idx = torch.randperm(n_total)[:n].tolist()
+        return torch.utils.data.Subset(base_ds, idx)
+
+    train_subset = _fixed_subset(train_ds, train_size, dataset_prop)
+    val_subset = _fixed_subset(val_ds, val_size, dataset_prop)
+
+    if dataset_prop < 1.0:
+        print(f"Using {dataset_prop:.1%} of data: "
+              f"{len(train_subset):,} train / {len(val_subset):,} val samples (fixed for this run).")
+
+    # Optional Preloading into RAM
+    preload = args.preload if args.preload is not None else train_cfg.get("preload", False)
+    if preload:
+        print("Preloading data into RAM...")
+        def _preload_subset(subset):
+            # Using a simple loop; since num_workers=0 here it's slow but happens once.
+            x_samples = [] # list of lists of tensors
+            y_samples = []
+            for i in tqdm(range(len(subset)), desc="Preloading"):
+                x, y = subset[i]
+
+                if x[2].shape[0] != 1008:
+                    continue
+                x_samples.append(x)
+                y_samples.append(y)
+            
+            # x_samples: N samples x M mosaics x (Cells, Win)
+            # We want M mosaics x N samples x Cells x Win
+            num_mosaics = len(x_samples[0])
+            x_preloaded = []
+            for m in range(num_mosaics):
+                x_preloaded.append(torch.stack([s[m] for s in x_samples]))
+            
+            y_preloaded = torch.stack(y_samples)
+            return x_preloaded, y_preloaded
+
+        train_x, train_y = _preload_subset(train_subset)
+        val_x, val_y = _preload_subset(val_subset)
+
+        # Custom TensorDataset-like structure for the list of mosaic tensors
+        class PreloadedDataset(Dataset):
+            def __init__(self, x_list, y):
+                self.x_list = x_list
+                self.y = y
+            def __len__(self): return len(self.y)
+            def __getitem__(self, i):
+                return [x[i] for x in self.x_list], self.y[i]
+
+        train_ds_final = PreloadedDataset(train_x, train_y)
+        val_ds_final = PreloadedDataset(val_x, val_y)
+        
+        # Once preloaded, we don't need many workers or complex contexts
+        loader_kwargs = {"batch_size": batch_size, "num_workers": 0, "pin_memory": True}
+        train_loader = DataLoader(train_ds_final, shuffle=True, **loader_kwargs)
+        val_loader = DataLoader(val_ds_final, shuffle=False, **loader_kwargs)
+    else:
+        # Standard Lazy Loading
+        loader_kwargs = {
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "pin_memory": True,
+            "persistent_workers": (num_workers > 0),
+            "multiprocessing_context": "spawn" if num_workers > 0 else None
+        }
+        train_loader = DataLoader(train_subset, shuffle=True, **loader_kwargs)
+        val_loader = DataLoader(val_subset, shuffle=False, **loader_kwargs)
 
     # 3. Model Initialization
     decoder_params = {
@@ -211,10 +285,17 @@ def main():
     parser.add_argument("--params", type=str, default="params.yaml", help="Path to the retina model params.yaml.")
     parser.add_argument("--training-params", type=str, default="training_params.yaml", help="Path to training_params.yaml.")
     parser.add_argument("--output", type=str, default="best_decoder.pt", help="Path to save the best model weights.")
-    parser.add_argument("--device", type=str, help="Device to use (cpu, cuda). Overrides training_params.yaml.")
-    parser.add_argument("--epochs", type=int, help="Number of epochs. Overrides training_params.yaml.")
-    parser.add_argument("--batch-size", type=int, help="Batch size. Overrides training_params.yaml.")
-    parser.add_argument("--lr", type=float, help="Learning rate. Overrides training_params.yaml.")
+    parser.add_argument("--device",      type=str,   help="Device to use (cpu, cuda). Overrides training_params.yaml.")
+    parser.add_argument("--epochs",      type=int,   help="Number of epochs. Overrides training_params.yaml.")
+    parser.add_argument("--batch-size",  type=int,   help="Batch size. Overrides training_params.yaml.")
+    parser.add_argument("--lr",          type=float, help="Learning rate. Overrides training_params.yaml.")
+    parser.add_argument("--dataset-prop", type=float, default=None,
+                        help="Fraction of data to use (0, 1]. A fixed random subset is drawn once at startup. "
+                             "Overrides training_params.yaml.")
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader worker processes for parallel HDF5 reading. Overrides training_params.yaml.")
+    parser.add_argument("--preload", action="store_true", default=None,
+                        help="Preload the entire subset into RAM before training. Much faster but requires enough RAM.")
 
     args = parser.parse_args()
     train(args)

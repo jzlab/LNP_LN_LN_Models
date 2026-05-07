@@ -121,4 +121,4 @@ OFF_Midget:
 
 video_parameters:
   frame_shape: [128, 128]
-  frame_rate: 30
+  frame_rate: 45

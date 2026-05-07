@@ -393,25 +393,13 @@ class RetinalGanglionCellMosaic(nn.Module):
                 # Extract indices for this minibatch: (C_chunk, RF_Pixels)
                 indices = self.rf_indices_tensor[c_start:c_end]
                 
-                # Gather patches for all cells and windows in batch simultaneously
-                # x_chunk is (T_chunk, Win_size, Padded_Pixels)
-                # indices is (C_chunk, RF_Pixels)
-                # We want result: (T_chunk, C_chunk, Win_size * RF_Pixels)
-                
-                # Use advanced indexing to gather across windows and cells
-                # We need to expand indices to (T_chunk, C_chunk, RF_Pixels)
-                # and take from x_chunk's last dimension.
-                
                 # Shape: (T_chunk, Win_size, C_chunk, RF_Pixels)
                 patches = x_chunk[:, :, indices] 
                 
                 # Reshape to (T_chunk, C_chunk, Win_size * RF_Pixels)
-                # .permute(0, 2, 1, 3) -> (T_chunk, C_chunk, Win_size, RF_Pixels)
                 patches = patches.permute(0, 2, 1, 3).reshape(t_end - t_start, c_end - c_start, -1)
                 
                 # Matrix multiplication with shared filter w: (T_chunk, C_chunk)
-                # self.w is (Win_size * RF_Pixels)
-                # results: (T_chunk, C_chunk)
                 linear[c_start:c_end, t_start:t_end] = (patches @ self.w).T
 
         # Apply activation and cap firing rate

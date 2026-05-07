@@ -5,8 +5,12 @@ import yaml
 
 import numpy as np
 import cv2
+import decord
 import torch
 import numexpr as ne
+import h5py
+import glob
+from tqdm import tqdm
 
 class Utils:
 
@@ -42,23 +46,119 @@ class Utils:
 
         return params
     
-    def read_video(path:str):
+    def read_video(path: str, stream: bool = False, chunk_frames: int = 1000, win_overlap: int = 0):
+        """Read a video file, either fully or as a streaming generator.
 
-        # open the video and get properties
-        cap = cv2.VideoCapture(path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-        height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-        total_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        Args:
+            path (str): Path to the video file.
+            stream (bool): If False (default), load all frames into memory and return
+                a single numpy array.  If True, return a generator that yields one
+                numpy chunk at a time so that only `chunk_frames` frames are ever
+                held in memory simultaneously.
+            chunk_frames (int): Number of *new* frames per yielded chunk when
+                streaming.  Ignored when stream=False.
+            win_overlap (int): Number of frames from the end of the previous chunk
+                to prepend to each new chunk.  Use this to provide the temporal
+                filter's look-back window so boundary windows are computed correctly.
+                Ignored when stream=False.
 
-        # read the actual frames in B&W
-        frames = []
-        while True:
-            ret, f = cap.read()
-            if not ret:
-                break
-            frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.)
-        cap.release()
+        Returns:
+            Non-streaming: (frames_array, props_dict)
+                frames_array: float32 ndarray of shape (T, H, W), values in [0, 1].
+                props_dict:   {"fps", "width", "height", "total_frames"}.
+            Streaming: (generator, props_dict)
+                Each iteration of the generator yields a float32 ndarray of shape
+                (chunk_T, H, W).  The very first chunk has no prepended overlap.
+        """
 
-        # return the frames and relevant properties
-        return np.array(frames), {"fps": fps, "width": width, "height": height, "total_frames": total_frames}
+        # Open the video and collect properties (fast — no frame decode yet)
+        vr = decord.VideoReader(path, ctx=decord.cpu(0))
+        fps = vr.get_avg_fps()
+        height, width = vr[0].shape[:2]
+        total_frames = len(vr)
+        props = {"fps": fps, "width": width, "height": height, "total_frames": total_frames}
+
+        def _to_gray(raw):
+            """Convert a uint8 (T, H, W, 3) batch to float32 (T, H, W) grayscale."""
+            return (raw @ np.array([0.2989, 0.5870, 0.1140], dtype=np.float32)) / 255.0
+
+        if not stream:
+            # --- Bulk mode: original behaviour ---
+            frames = vr.get_batch(range(total_frames - 1)).asnumpy()
+            frames = _to_gray(frames)
+            return frames, props
+
+        # --- Streaming mode ---
+        def _frame_generator():
+            prev_tail = None  # holds the overlap tail from the previous chunk
+
+            for chunk_start in range(0, total_frames, chunk_frames):
+                chunk_end = min(chunk_start + chunk_frames, total_frames)
+                indices = list(range(chunk_start, chunk_end))
+                raw = vr.get_batch(indices).asnumpy()
+                chunk = _to_gray(raw)
+
+                if prev_tail is not None and win_overlap > 0:
+                    # Prepend the overlap from the previous chunk so the caller
+                    # can form complete temporal windows across the boundary.
+                    chunk = np.concatenate([prev_tail, chunk], axis=0)
+
+                # Save the tail of this chunk (before yield, so it's not GC'd)
+                if win_overlap > 0:
+                    prev_tail = chunk[-win_overlap:]
+
+                yield chunk
+
+                # Explicitly delete raw frames to free memory promptly
+                del raw, chunk
+
+        return _frame_generator(), props
+
+    @staticmethod
+    def migrate_h5_transposition(path: str):
+        """Migrate HDF5 activation files to transposed format (T_windows, n_cells) in-place.
+        
+        Args:
+            path (str): Path to a single .h5 file or a directory containing them.
+        """
+        if os.path.isdir(path):
+            h5_files = sorted(glob.glob(os.path.join(path, "*.h5")))
+        elif os.path.isfile(path):
+            h5_files = [path]
+        else:
+            print(f"Error: {path} is not a valid file or directory.")
+            return
+
+        print(f"Found {len(h5_files)} files to migrate in-place.")
+        
+        for fp in tqdm(h5_files, desc="Migrating In-Place"):
+            try:
+                with h5py.File(fp, 'r+') as f:
+                    if "trials" not in f:
+                        continue
+
+                    trials_grp = f["trials"]
+                    for trial_id in trials_grp.keys():
+                        trial_grp = trials_grp[trial_id]
+                        if "firing_rates" not in trial_grp:
+                            continue
+                            
+                        fr_grp = trial_grp["firing_rates"]
+                        for m_id in list(fr_grp.keys()):
+                            ds = fr_grp[m_id]
+                            data = ds[()]
+                            
+                            if data.ndim == 2:
+                                # Old format: (n_cells, T) -> shape[0] < shape[1]
+                                if data.shape[0] > data.shape[1]:
+                                    continue # Already transposed
+                                
+                                transposed_data = data.T
+                                compression = ds.compression
+                                del fr_grp[m_id]
+                                fr_grp.create_dataset(m_id, data=transposed_data, compression=compression or "lzf")
+            except Exception as e:
+                print(f"Error migrating {os.path.basename(fp)}: {e}")
+
+        print("\nMigration complete. Reclaim space with 'h5repack' if desired.")
+
